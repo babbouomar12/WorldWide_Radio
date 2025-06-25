@@ -1,0 +1,310 @@
+{# templates/radio/index.html.twig #}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Radio Garden Player</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css">
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; font-family: Arial, sans-serif; }
+        #map { height: 80vh; width: 100%; }
+        #player {
+            height: 20vh;
+            background: #222;
+            color: #eee;
+            display: flex;
+            align-items: center;
+            padding: 0 1rem;
+        }
+        #station-info { flex-grow: 1; }
+        #station-name { font-weight: bold; }
+        #station-location { font-size: 0.9em; color: #aaa; }
+        audio { width: 300px; }
+        .loading { color: #aaa; font-style: italic; }
+        .error { color: #ff6b6b; }
+        .controls { padding: 0.5rem; background: #f5f5f5; }
+
+        /* Marker styles */
+        .leaflet-marker-icon {
+            transition: transform 0.2s;
+        }
+        .leaflet-marker-icon:hover {
+            transform: scale(1.2);
+        }
+        .current-station {
+            filter: hue-rotate(120deg) brightness(1.2);
+            transform: scale(1.3);
+            z-index: 1000;
+        }
+        .station-popup .leaflet-popup-content {
+            margin: 10px;
+            min-width: 200px;
+        }
+        .station-popup button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 8px 12px;
+            margin-top: 8px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .country-cluster {
+            background: #4CAF50;
+            color: white;
+            border-radius: 50%;
+            padding: 8px;
+            text-align: center;
+            border: 2px solid white;
+            box-shadow: 0 0 10px rgba(0,0,0,0.3);
+        }
+    </style>
+</head>
+<body>
+<div class="controls">
+    <button id="refresh-btn">Refresh Stations</button>
+    <span id="status"></span>
+</div>
+<div id="map"></div>
+<div id="player">
+    <div id="station-info">
+        <div id="station-name" class="loading">Select a station</div>
+        <div id="station-location"></div>
+    </div>
+    <audio id="audio" controls></audio>
+</div>
+<div class="controls">
+    <!-- Add this select element FIRST -->
+    <select id="country-select">
+        <option value="">Select a country</option>
+    </select>
+    <button id="refresh-btn">Refresh Stations</button>
+    <span id="status"></span>
+</div>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script>
+    // Initialize map
+    const map = L.map('map').setView([20, 0], 2);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors',
+        maxZoom: 18,
+    }).addTo(map);
+
+    // DOM elements
+    const audio = document.getElementById('audio');
+    const stationName = document.getElementById('station-name');
+    const stationLocation = document.getElementById('station-location');
+    const statusElement = document.getElementById('status');
+    const refreshBtn = document.getElementById('refresh-btn');
+
+    // Layer groups
+    const placesGroup = L.layerGroup().addTo(map);
+    const stationsGroup = L.layerGroup().addTo(map);
+
+    // Current station tracking
+    let currentStation = null;
+    const defaultIcon = L.icon({
+        iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon.png',
+        iconSize: [25, 41],
+        iconAnchor: [12, 41],
+        popupAnchor: [1, -34]
+    });
+    const selectedIcon = L.icon({
+        iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon-green.png',
+        iconSize: [25, 41],
+        iconAnchor: [12, 41],
+        popupAnchor: [1, -34]
+    });
+
+    // Update status message
+    function setStatus(text, type = '') {
+        statusElement.textContent = text;
+        statusElement.className = type;
+    }
+
+    // Update station info display
+    function updateStationInfo(name, location) {
+        stationName.textContent = name || 'Select a station';
+        stationName.className = name ? '' : 'loading';
+        stationLocation.textContent = location || '';
+    }
+
+    // Fetch through Symfony proxy
+    async function fetchRadioData(url) {
+        try {
+            const proxyUrl = `/api/radio-proxy?url=${encodeURIComponent(url)}`;
+            const response = await fetch(proxyUrl);
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            return await response.json();
+        } catch (e) {
+            setStatus('Network error. Please try again.', 'error');
+            console.error('Fetch error:', e);
+            throw e;
+        }
+    }
+
+    // Load places from Radio Garden API
+    async function loadPlaces() {
+        try {
+            setStatus('Loading cities...', 'loading');
+            const data = await fetchRadioData('https://radio.garden/api/ara/content/places');
+
+            placesGroup.clearLayers();
+            stationsGroup.clearLayers();
+            setStatus('', '');
+            updateStationInfo('Select a city', '');
+
+            data.data.list.forEach(place => {
+                const marker = L.marker([place.geo[0], place.geo[1]], {
+                    icon: defaultIcon
+                });
+                marker.bindPopup(`<b>${place.title}</b><br>${place.subtitle || ''}`);
+                marker.on('click', () => loadStations(place.url));
+                placesGroup.addLayer(marker);
+            });
+
+        } catch (e) {
+            setStatus('Failed to load cities. Try refreshing.', 'error');
+            console.error('Load places error:', e);
+        }
+    }
+
+    // Load stations for a place
+    async function loadStations(placeUrl) {
+        try {
+            setStatus('Loading stations...', 'loading');
+            const pageData = await fetchRadioData(`https://radio.garden${placeUrl}`);
+
+            stationsGroup.clearLayers();
+            currentStation = null;
+
+            if (!pageData.content || pageData.content.length === 0) {
+                setStatus('No stations found here', 'error');
+                return;
+            }
+
+            pageData.content.forEach(item => {
+                if (item.type === 'channel') {
+                    const marker = L.marker([item.geo[0], item.geo[1]], {
+                        icon: defaultIcon,
+                        stationId: item.id
+                    });
+
+                    const popupContent = `
+                        <div class="station-popup">
+                            <b>${item.title}</b><br>
+                            ${item.subtitle || ''}<br>
+                            <button onclick="window.playStation('${item.id}', '${escapeHtml(item.title)}', '${escapeHtml(item.subtitle || '')}')">
+                                Play Station
+                            </button>
+                        </div>
+                    `;
+
+                    marker.bindPopup(popupContent);
+                    marker.on('click', () => playStation(item.id, item.title, item.subtitle));
+                    stationsGroup.addLayer(marker);
+                }
+            });
+
+            setStatus('', '');
+            map.fitBounds(stationsGroup.getBounds().pad(0.5));
+
+        } catch (e) {
+            setStatus('Failed to load stations', 'error');
+            console.error('Load stations error:', e);
+        }
+    }
+
+    // Play station
+    function playStation(stationId, title, subtitle) {
+        try {
+            // Remove highlight from previous station
+            if (currentStation) {
+                currentStation.marker.setIcon(defaultIcon);
+            }
+
+            // Find and highlight new station
+            stationsGroup.eachLayer(layer => {
+                if (layer.options.stationId === stationId) {
+                    layer.setIcon(selectedIcon);
+                    layer.openPopup();
+                    currentStation = {
+                        id: stationId,
+                        marker: layer,
+                        title: title,
+                        subtitle: subtitle
+                    };
+                }
+            });
+
+            // Update UI
+            updateStationInfo(title, subtitle);
+
+            // Set audio source
+            audio.src = `https://radio.garden/api/ara/content/listen/${stationId}/channel.mp3`;
+
+            // Try to autoplay (might require user interaction)
+            audio.play().catch(e => {
+                setStatus('Click play button to start', 'loading');
+            });
+
+        } catch (e) {
+            setStatus('Playback failed', 'error');
+            console.error('Play error:', e);
+        }
+    }
+
+    // Helper function to escape HTML for popup content
+    function escapeHtml(unsafe) {
+        return unsafe
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+    // Add this with your other functions
+    async function loadCountries() {
+        const data = await fetchRadioData('https://radio.garden/api/ara/content/places');
+        countries = {};
+
+        data.data.list.forEach(place => {
+            const countryCode = place.url.split('/')[3];
+            if (!countries[countryCode]) {
+                countries[countryCode] = {
+                    code: countryCode,
+                    name: place.subtitle || countryCode,
+                    places: [],
+                    bounds: L.latLngBounds([place.geo[0], place.geo[1]])
+                };
+            }
+            countries[countryCode].places.push(place);
+            countries[countryCode].bounds.extend([place.geo[0], place.geo[1]]);
+        });
+
+        // Populate dropdown
+        countrySelect.innerHTML = '<option value="">Select a country</option>';
+        Object.values(countries).forEach(country => {
+            const option = document.createElement('option');
+            option.value = country.code;
+            option.textContent = country.name;
+            countrySelect.appendChild(option);
+        });
+    }
+
+    // Make playStation available globally for popup buttons
+    window.playStation = playStation;
+
+    // Event listeners
+    refreshBtn.addEventListener('click', loadPlaces);
+
+    // Initial load
+    loadPlaces();
+</script>
+</body>
+</html>
